@@ -1,0 +1,536 @@
+---
+title: "Mental Health Outcomes Classification Models"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(dplyr)
+library(lavaan)
+library(psych)
+library(tidyr)
+library(glmnet)
+library(pROC)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(randomForestExplainer)
+library(e1071)
+```
+
+```{r import-data}
+dat1 <- read.csv("HMS_2022-2023_PUBLIC_instchars.csv",na=c("","NA","-999"))
+```
+
+```{r select-vars}
+dat2 <- dat1%>%dplyr::select(c(
+# age
+age,
+# sex
+sex_birth,
+# gender
+gender_male,
+gender_female,
+gender_transm,
+gender_transf,
+gender_queer,
+gender_selfid,
+gender_nonbin,
+gender_prefnoresp,
+# sexual orientation
+sexual_h,
+sexual_l,
+sexual_g,
+sexual_bi,
+sexual_queer,
+sexual_quest,
+sexual_selfid,
+sexual_text,
+sexual_asexual,
+sexual_pan,
+sexual_prefnoresp,
+# race/eth
+race_black,
+race_ainaan,
+race_asian,
+race_his,
+race_pi,
+race_mides,
+race_white,
+race_other,
+# dep
+phq9_1,
+phq9_2,
+phq9_3,
+phq9_4,
+phq9_5,
+phq9_6,
+phq9_7,
+phq9_8,
+phq9_9,
+# anx
+gad7_1,
+gad7_2,
+gad7_3,
+gad7_4,
+gad7_5,
+gad7_6,
+gad7_7,
+# selfinj
+sib_any,
+# suicide
+sui_idea,
+sui_plan,
+sui_att,
+# loneliness
+lone_lackcompanion,
+lone_leftout,
+lone_isolated,
+# diagnoses
+dx_dep,
+dx_bip,
+dx_anx,
+dx_ocd,
+dx_trauma,
+dx_neurodev,
+dx_ea,
+dx_psy,
+dx_pers,
+dx_sa,
+dx_none,
+dx_dk,
+# number of therapy visits past 12 months
+ther_vis,
+# satisfied with overall therapy or counseling experience
+sat_ther_overall,
+# how helpful was therapy or counseling was for mental or emotional health?
+ther_helped_me,
+# medications currently taking
+meds_cur_1,
+meds_cur_2,
+meds_cur_3,
+meds_cur_4,
+meds_cur_5,
+meds_cur_6,
+meds_cur_7,
+meds_cur_7_text,
+# duration of each med
+meds_time_1,
+meds_time_2,
+meds_time_3,
+meds_time_4,
+meds_time_5,
+meds_time_6,
+meds_time_7,
+# how helpful was medication for mental or emotional health?
+meds_helped_me,
+))
+```
+
+```{r code-vars}
+# create binary and categorical variables based on responses
+dat2$dx_mult <- ifelse(rowSums(dat2[c(53:62)]) > 1, 1, 0)
+dat2$medresit <- ifelse(dat2$meds_helped_me > 3, 1, 0)
+dat2$terresit <- ifelse(dat2$ther_helped_me > 3, 1, 0)
+dat2$tr <- ifelse(rowSums(dat2[c(85,86)]) > 1, 1, 0)
+dat2$tr_type <- ifelse(dat2$medresit == 1 & dat2$terresit == 0 & dat2$tr == 0, "meds only",
+                     ifelse(dat2$medresit == 0 & dat2$terresit == 1 & dat2$tr == 0, "therapy only",
+                            ifelse(dat2$medresit == 0 & dat2$terresit == 0 & dat2$tr == 1, "meds and theraoy",
+                                   "not resistant")))
+
+# convert NA to 0 for model
+col_to_change <- c(1:30, 53:64, 68:82, 84)
+dat2[col_to_change][is.na(dat2[col_to_change])] <- 0
+
+# change these columns to factors
+columns_to_factor <- c(2:29, 46:49, 53:64, 68:74, 85:87)
+dat2[columns_to_factor] <- lapply(dat2[columns_to_factor], as.factor)
+```
+
+```{r subset-training-data}
+# training data for binary category
+dat3 <- dat2[!is.na(dat2$tr),]
+dat3 <- dat3[-c(48,49)]
+
+# remove rows with NA
+dat4 <- na.omit(dat3)
+
+# re-code binary outcome var
+dat4$tr_cat <- ifelse(dat4$tr == 0, "No", "Yes")
+dat4$tr_cat <- as.factor(dat4$tr_cat)
+
+# create training and testing data
+total_rows <- nrow(dat4)
+train_rows <- round(0.8 * total_rows) 
+index <- sample(1:total_rows, total_rows)
+train <- dat4[index[1:train_rows], ]
+test <- dat4[index[(train_rows + 1):total_rows], ]
+
+train$age <- as.integer(train$age)
+train$phq9_1 <- as.integer(train$phq9_1)
+```
+
+```{r logit-all}
+# first logit model with all features
+# predicts classification of all "no", likely due to uneven class weighting
+
+logit_model <- glm(tr ~ age + sex_birth + gender_male + gender_female + sexual_h 
+                     + race_white + phq9_1 + phq9_2 + phq9_3 + phq9_4 + phq9_5 
+                     + phq9_6 + phq9_7 + phq9_8 + phq9_9 + gad7_1 + gad7_2 + gad7_3 
+                     + gad7_4 + gad7_5 + gad7_6 + gad7_7 + lone_lackcompanion 
+                     + lone_leftout + lone_isolated + sib_any + sui_idea 
+                     + dx_dep + dx_bip + dx_anx + dx_ocd + dx_trauma + dx_neurodev 
+                     + dx_ea + dx_psy + dx_pers + dx_sa + dx_none + dx_dk + dx_mult, 
+                   data = train,
+                   family = binomial)
+
+summary(logit_model)
+
+# logit prediction (train)
+train$prob <- predict(logit_model, type="response")
+train$pred <- ifelse(train$prob>.5, "Yes", "No")
+train$ycat <- as.factor(train$tr_cat)
+train$pred <- as.factor(train$pred)
+
+cm_logit_train <- confusionMatrix(train$pred, train$tr_cat, positive = "Yes")
+print(cm_logit_train)
+
+# logit model performance (train)
+accuracy_logit_train <- cm_logit_train$overall["Accuracy"]
+precision_logit_train <- cm_logit_train$byClass["Precision"]
+recall_logit_train <- cm_logit_train$byClass["Recall"]
+
+roc_logit_train <- roc(train$ycat, train$prob)
+plot(roc_logit_train, main = "ROC Curve Training Data", print.auc = TRUE)
+
+# logit prediction (test)
+test$prob <- predict(logit_model, newdata = test, type="response")
+test$pred <- ifelse(test$prob>.5, "Yes", "No")
+test$ycat <- as.factor(test$tr_cat)
+test$pred <- as.factor(test$pred)
+
+cm_logit_test <- confusionMatrix(test$pred, test$tr_cat, positive = "Yes")
+print(cm_logit_test)
+
+# logit model performance (test)
+accuracy_logit_test <- cm_logit_test$overall["Accuracy"]
+precision_logit_test <- cm_logit_test$byClass["Precision"]
+recall_logit_test <- cm_logit_test$byClass["Recall"]
+
+roc_logit_test <- roc(test$tr_cat, test$prob)
+plot(roc_logit_test, main = "ROC Curve Test Data", print.auc = TRUE)
+```
+
+```{r logit-weighted}
+# logit model with all features, added weights due to uneven class size
+weights <- ifelse(train$tr == 0, 1, 61) 
+
+logit_w_model <- glm(tr ~ age + sex_birth + gender_male + gender_female + sexual_h 
+                   + race_white + phq9_1 + phq9_2 + phq9_3 + phq9_4 + phq9_5 
+                   + phq9_6 + phq9_7 + phq9_8 + phq9_9 + gad7_1 + gad7_2 + gad7_3 
+                   + gad7_4 + gad7_5 + gad7_6 + gad7_7 + lone_lackcompanion 
+                   + lone_leftout + lone_isolated + sib_any + sui_idea 
+                   + dx_dep + dx_bip + dx_anx + dx_ocd + dx_trauma + dx_neurodev 
+                   + dx_ea + dx_psy + dx_pers + dx_sa + dx_none + dx_dk + dx_mult, 
+             data = train, 
+             weights = weights, 
+             family = binomial)
+
+summary(logit_w_model)
+
+# logit weighted prediction (train)
+train$prob <- predict(logit_w_model, type="response")
+train$pred <- ifelse(train$prob>.5, "Yes", "No")
+train$ycat <- as.factor(train$tr_cat)
+train$pred <- as.factor(train$pred)
+
+cm_logit_w_train <- confusionMatrix(train$pred, train$tr_cat, positive = "Yes")
+print(cm_logit_w_train)
+
+# logit weighted model performance (train)
+accuracy_logit_w_train <- cm_logit_w_train$overall["Accuracy"]
+precision_logit_w_train <- cm_logit_w_train$byClass["Precision"]
+recall_logit_w_train <- cm_logit_w_train$byClass["Recall"]
+
+roc_logit_w_train <- roc(train$ycat, train$prob)
+plot(roc_logit_w_train, main = "ROC Curve Training Data", print.auc = TRUE)
+
+# logit weighted prediction (test)
+test$prob <- predict(logit_w_model, newdata = test, type="response")
+test$pred <- ifelse(test$prob>.5, "Yes", "No")
+test$ycat <- as.factor(test$tr_cat)
+test$pred <- as.factor(test$pred)
+
+cm_logit_w_test <- confusionMatrix(test$pred, test$tr_cat, positive = "Yes")
+print(cm_logit_w_test)
+
+# logit weighted model performance (test)
+accuracy_logit_w_test <- cm_logit_w_test$overall["Accuracy"]
+precision_logit_w_test <- cm_logit_w_test$byClass["Precision"]
+recall_logit_w_test <- cm_logit_w_test$byClass["Recall"]
+
+roc_logit_w_test <- roc(test$tr_cat, test$prob)
+plot(roc_logit_w_test, main = "ROC Curve Test Data", print.auc = TRUE)
+
+precision_logit_w_test
+recall_logit_w_test
+```
+
+```{r logit-lasso}
+# logit model with lasso regression
+X <- as.matrix(train[, c( "age", "sex_birth", "gender_male", "gender_female", "sexual_h", "race_white", 
+                       "phq9_1", "phq9_2", "phq9_3", "phq9_4", "phq9_5", "phq9_6", "phq9_7", "phq9_8", "phq9_9", 
+                       "gad7_1", "gad7_2", "gad7_3", "gad7_4", "gad7_5", "gad7_6", "gad7_7",
+                       "lone_lackcompanion", "lone_leftout","lone_isolated","sib_any", "sui_idea", "dx_dep", 
+                       "dx_bip", "dx_anx", "dx_ocd", "dx_trauma", "dx_neurodev", "dx_ea", "dx_psy", 
+                       "dx_pers", "dx_sa", "dx_none", "dx_dk", "dx_mult"
+)])
+
+Y <- train$tr
+
+# making lasso model
+lasso_model <- glmnet(X, Y, family = "binomial", alpha = 1)
+
+# cross validation to find best lambda, then refitting the model with that value
+cv_lasso <- cv.glmnet(X, Y, family = "binomial", alpha = 1)
+best_lambda <- cv_lasso$lambda.min
+lasso_best <- glmnet(X, Y, family = "binomial", alpha = 1, lambda = best_lambda)
+
+# feature importance
+coef(lasso_best)
+```
+
+```{r logit-reduced}
+# logit model, drop features in accordance with lasso above
+weights <- ifelse(train$tr == 0, 1, 61) 
+logit_red_model <- glm(tr ~ age + sex_birth + 
+                      phq9_1 + phq9_3 + phq9_5 + phq9_9 + 
+                      gad7_2 + gad7_5 + gad7_6 + 
+                      lone_lackcompanion + lone_isolated + 
+                      sib_any + sui_idea + 
+                      dx_dep + dx_bip + dx_anx + dx_neurodev 
+                      + dx_ea + dx_psy + dx_none, 
+             data = train, 
+             weights = weights, 
+             family = binomial)
+
+summary(logit_red_model)
+
+# logit reduced prediction (train)
+train$prob2 <- predict(logit_red_model, type="response")
+train$pred2 <- ifelse(train$prob2>.5, "Yes", "No")
+train$pred2 <- as.factor(train$pred2)
+
+cm_logit_red_train <- confusionMatrix(train$pred2, train$tr_cat, positive = "Yes")
+print(cm_logit_red_train)
+
+# logit reduced model performance (train)
+accuracy_logit_red_train <- cm_logit_red_train$overall["Accuracy"]
+precision_logit_red_train <- cm_logit_red_train$byClass["Precision"]
+recall_logit_red_train <- cm_logit_red_train$byClass["Recall"]
+
+roc_logit_red_train <- roc(train$ycat, train$prob2)
+plot(roc_logit_red_train, main = "ROC Curve Training Data", print.auc = TRUE)
+
+# logit reduced prediction (test)
+test$prob2 <- predict(logit_red_model, newdata = test, type="response")
+test$pred2 <- ifelse(test$prob2>.5, "Yes", "No")
+test$pred2 <- as.factor(test$pred2)
+
+cm_logit_red_test <- confusionMatrix(test$pred2, test$tr_cat, positive = "Yes")
+print(cm_logit_red_test)
+
+# logit reduced model performance (test)
+accuracy_logit_red_test <- cm_logit_red_test$overall["Accuracy"]
+precision_logit_red_test <- cm_logit_red_test$byClass["Precision"]
+recall_logit_red_test <- cm_logit_red_test$byClass["Recall"]
+
+roc_logit_red_test <- roc(test$tr_cat, test$prob2)
+plot(roc_logit_red_test, main = "ROC Curve Test Data", print.auc = TRUE)
+
+precision_logit_red_test 
+recall_logit_red_test 
+```
+
+```{r forest}
+# forest model and feature importance, weighted, using all features
+weights <- c('1' = 61, '0' = 1)
+
+forest_model <- randomForest(tr ~ age + sex_birth + gender_male + 
+                              gender_female + sexual_h + race_white + phq9_1 + phq9_2 + phq9_3 + 
+                              phq9_4 + phq9_5 + phq9_6 + phq9_7 + phq9_8 + phq9_9 + gad7_1 + 
+                              gad7_2 + gad7_3 + gad7_4 + gad7_5 + gad7_6 + gad7_7 + lone_lackcompanion + 
+                              lone_leftout + lone_isolated + sib_any + sui_idea + dx_dep + dx_bip + 
+                              dx_anx + dx_ocd + dx_trauma + dx_neurodev + dx_ea + dx_psy + dx_pers + 
+                              dx_sa + dx_none + dx_dk + dx_mult,
+                            data = train, 
+                            ntree = 250, 
+                            importance = TRUE, 
+                            method = "class",
+                            classwt = weights
+)
+
+# variable importance
+forest_imp <- importance(forest_model)
+
+# convert to data frame for ggplot
+importance_df <- data.frame(Feature = rownames(forest_imp), Importance = forest_imp[, "MeanDecreaseAccuracy"])
+importance_df_gini <- data.frame(Feature = rownames(forest_imp), Importance = forest_imp[, "MeanDecreaseGini"])
+
+# create plot, mean decrease ACCURACY
+ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Feature Importance: Mean Decrease Accuracy", x = "Features", y = "Importance") +
+  coord_flip()  # flips axes for horizontal bars
+
+# create plot, mean decrease GINI
+ggplot(importance_df_gini, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Feature Importance: Mean Decrease GINI", x = "Features", y = "Importance") +
+  coord_flip()  # flips axes for horizontal bars
+
+# forest prediction (train)
+for_pred <- predict(forest_model, type = "prob")[,2]
+
+train$forest_pred <- predict(forest_model, type = "prob")[,2]
+train$forest_pred_cat <- ifelse(train$forest_pred > 0.5, "Yes", "No")
+train$forest_pred_cat <- as.factor(train$forest_pred_cat)
+
+cm_forest_train <- confusionMatrix(train$forest_pred_cat, train$tr_cat, positive = "Yes")
+print(cm_forest_train)
+
+# forest model performance (train)
+accuracy_forest_train <- cm_forest_train$overall["Accuracy"]
+precision_forest_train <- cm_forest_train$byClass["Precision"]
+recall_forest_train <- cm_forest_train$byClass["Recall"]
+
+roc_forest_train <- roc(train$tr_cat, train$forest_pred)
+plot(roc_forest_train, main = "ROC Curve Training Data: Classifiction Tree", print.auc = TRUE)
+
+# forest prediction (test)
+test$forest_pred <- predict(forest_model, newdata = test, type = "prob")[,2]
+test$forest_pred_cat <- ifelse(test$forest_pred > 0.5, "Yes", "No")
+test$forest_pred_cat <- as.factor(test$forest_pred_cat)
+
+cm_forest_test <- confusionMatrix(test$forest_pred_cat, test$tr_cat, positive = "Yes")
+print(cm_forest_test)
+
+# forest model performance (test)
+accuracy_forest_test <- cm_forest_test$overall["Accuracy"]
+precision_forest_test <- cm_forest_test$byClass["Precision"]
+recall_forest_test <- cm_forest_test$byClass["Recall"]
+
+roc_forest_test <- roc(test$tr_cat, test$forest_pred)
+plot(roc_forest_test, main = "ROC Curve Test Data: Classifiction Tree", print.auc = TRUE)
+```
+
+```{r forest-red}
+# forest model and feature importance, top 20 features based on GINI
+weights <- c('1' = 61, '0' = 1)
+
+forest_red_model <- randomForest(tr ~ phq9_1 + phq9_2 + phq9_3 + phq9_4 + phq9_5 + phq9_6 + phq9_7 + phq9_8 + phq9_9 + 
+                                   gad7_1 + gad7_2 + gad7_3 + gad7_4 + gad7_5 + gad7_6 + gad7_7 + 
+                                   lone_lackcompanion + lone_leftout + lone_isolated,
+                                 data = train, 
+                                 ntree = 250, 
+                                 importance = TRUE, 
+                                 method = "class",
+                                 classwt = weights
+)
+
+# variable importance
+forest_red_imp <- importance(forest_red_model)
+
+# convert to data frame for ggplot
+importance_df <- data.frame(Feature = rownames(forest_red_imp), Importance = forest_red_imp[, "MeanDecreaseAccuracy"])
+importance_df_gini <- data.frame(Feature = rownames(forest_red_imp), Importance = forest_red_imp[, "MeanDecreaseGini"])
+
+# create the plot, mean decrease ACCURACY
+ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Feature Importance: Mean Decrease Accuracy", x = "Features", y = "Importance") +
+  coord_flip()  # flips the axes for horizontal bars
+
+# create the plot, mean decrease GINI
+ggplot(importance_df_gini, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Feature Importance: Mean Decrease GINI", x = "Features", y = "Importance") +
+  coord_flip()  # flips the axes for horizontal bars
+
+# forest prediction (train)
+for_pred <- predict(forest_red_model, type = "prob")[,2]
+
+train$forest_red_pred <- predict(forest_red_model, type = "prob")[,2]
+train$forest_red_pred_cat <- ifelse(train$forest_red_pred > 0.5, "Yes", "No")
+train$forest_red_pred_cat <- as.factor(train$forest_red_pred_cat)
+
+cm_forest_red_train <- confusionMatrix(train$forest_red_pred_cat, train$tr_cat, positive = "Yes")
+print(cm_forest_red_train)
+
+# forest model performance (train)
+accuracy_forest_red_train <- cm_forest_red_train$overall["Accuracy"]
+precision_forest_red_train <- cm_forest_red_train$byClass["Precision"]
+recall_forest_red_train <- cm_forest_red_train$byClass["Recall"]
+
+roc_forest_red_train <- roc(train$tr_cat, train$forest_red_pred)
+plot(roc_forest_red_train, main = "ROC Curve Training Data: Classifiction Tree", print.auc = TRUE)
+
+# forest prediction (test)
+test$forest_red_pred <- predict(forest_red_model, newdata = test, type = "prob")[,2]
+test$forest_red_pred_cat <- ifelse(test$forest_red_pred > 0.5, "Yes", "No")
+test$forest_red_pred_cat <- as.factor(test$forest_red_pred_cat)
+
+cm_forest_red_test <- confusionMatrix(test$forest_red_pred_cat, test$tr_cat, positive = "Yes")
+print(cm_forest_red_test)
+
+# forest model performance (test)
+accuracy_forest_red_test <- cm_forest_red_test$overall["Accuracy"]
+precision_forest_red_test <- cm_forest_red_test$byClass["Precision"]
+recall_forest_red_test <- cm_forest_red_test$byClass["Recall"]
+
+roc_forest_red_test <- roc(test$tr_cat, test$forest_red_pred)
+plot(roc_forest_red_test, main = "ROC Curve Test Data: Classifiction Tree", print.auc = TRUE)
+```
+
+```{r svm}
+# svm using weights and all features
+
+svm_model <- svm(formula = tr ~ age + sex_birth + gender_male + gender_female 
+                   + sexual_h + race_white + phq9_1 + phq9_2 + phq9_3 + phq9_4 
+                   + phq9_5 + phq9_6 + phq9_7 + phq9_8 + phq9_9 + gad7_1 + gad7_2 
+                   + gad7_3 + gad7_4 + gad7_5 + gad7_6 + gad7_7 + lone_lackcompanion 
+                   + lone_leftout + lone_isolated + sib_any + sui_idea + dx_dep + dx_bip 
+                   + dx_anx + dx_ocd + dx_trauma + dx_neurodev + dx_ea + dx_psy + dx_pers 
+                   + dx_sa + dx_none + dx_dk + dx_mult, 
+                 data = train, 
+                 class.weights = c('1' = 61, '0' = 1),
+                 type = 'C-classification', kernel = 'polynomial',
+                 probability = TRUE)
+
+# predictions (train)
+train$SVM_pred <- predict(svm_model, train)
+train$SVM_pred_cat <- ifelse(train$SVM_pred == 1, "Yes", "No")
+train$SVM_pred_cat <- as.factor(train$SVM_pred_cat)
+
+cm_svm_train <- confusionMatrix(train$SVM_pred_cat, train$tr_cat, positive = "Yes")
+print(cm_svm_train)
+
+# predictions (test)
+test$SVM_pred <- predict(svm_model, test)
+test$SVM_pred_cat <- ifelse(test$SVM_pred == 1, "Yes", "No")
+test$SVM_pred_cat <- as.factor(test$SVM_pred_cat)
+
+cm_svm_test <- confusionMatrix(test$SVM_pred_cat, test$tr_cat, positive = "Yes")
+print(cm_svm_test)
+
+accuracy_svm_test <- cm_svm_test$overall["Accuracy"]
+precision_svm_test <- cm_svm_test$byClass["Precision"]
+recall_svm_test <- cm_svm_test$byClass["Recall"]
+```
